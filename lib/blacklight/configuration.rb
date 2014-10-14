@@ -6,7 +6,7 @@ module Blacklight
 
     require 'blacklight/configuration/view_config'
     require 'blacklight/configuration/tool_config'
-    # XXX this isn't very pretty, but it works.
+    require 'blacklight/configuration/arel_table'
     require 'blacklight/configuration/fields'
     require 'blacklight/configuration/solr_field'
     require 'blacklight/configuration/search_field'
@@ -28,10 +28,12 @@ module Blacklight
           :qt => 'search',
           # The path to send requests to solr.
           :solr_path => 'select',
+          :relation_decorators => [],
           # Default values of parameters to send with every search request
           :default_solr_params => {},
           # the model to load solr response documents into; set below in #initialize_default_values
-          :solr_document_model => nil,
+          # The model for the noSql document
+          :model => SolrDocument,
           # The solr rqeuest handler to use when requesting only a single document 
           :document_solr_request_handler => 'document',
           # THe path to send single document requests to solr
@@ -137,15 +139,23 @@ module Blacklight
       end
     end
     
-    def solr_document_model
+    def model
       super || SolrDocument
     end
 
+    def table
+      Blacklight::Configuration::BigTable.new(self)
+    end
     ##
     # DSL helper
     def configure
       yield self if block_given?
       self
+    end
+
+    def default_relation(user_params={})
+      rel = self.model.build_default_scope.spawn
+      self.relation_decorators.reduce(rel) {|dec, method| send(method, dec, user_params)}
     end
 
     ##

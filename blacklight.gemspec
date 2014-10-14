@@ -22,6 +22,8 @@ Gem::Specification.new do |s|
   s.add_dependency "kaminari", "~> 0.13"  # the pagination (page 1,2,3, etc..) of our search results
   s.add_dependency "rsolr",     "~> 1.0.6"  # Library for interacting with rSolr.
   s.add_dependency "bootstrap-sass", "~> 3.2"
+  s.add_dependency "ansr"
+  s.add_dependency "ansr_blacklight"
   s.add_dependency "deprecation"
 
   s.add_development_dependency "jettywrapper", ">= 1.7.0"

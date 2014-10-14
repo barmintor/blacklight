@@ -1,5 +1,6 @@
 # -*- encoding : utf-8 -*-
-class SolrDocument 
+require 'ansr_blacklight'
+class SolrDocument < Ansr::Blacklight::Base
 
   include Blacklight::Solr::Document
 

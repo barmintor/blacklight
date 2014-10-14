@@ -66,6 +66,8 @@ module Blacklight::SolrHelper
     end
   end
 
+  DEFAULT_FACET_LIMIT = 10
+
   ##
   # Execute a solr query
   # @see [RSolr::Client#send_and_receive]
@@ -76,28 +78,31 @@ module Blacklight::SolrHelper
   # @overload find(params)
   #   @param [Hash] parameters for RSolr::Client#send_and_receive
   # @return [Blacklight::SolrResponse] the solr response object
+  private
   def find(*args)
     # In later versions of Rails, the #benchmark method can do timing
     # better for us. 
     benchmark("Solr fetch", level: :debug) do
       solr_params = args.extract_options!
-      path = args.first || blacklight_config.solr_path
-      solr_params[:qt] ||= blacklight_config.qt
-      # delete these parameters, otherwise rsolr will pass them through.
-      key = blacklight_config.http_method == :post ? :data : :params
-      res = blacklight_solr.send_and_receive(path, {key=>solr_params.to_hash, method:blacklight_config.http_method})
+      rel = blacklight_config.model.spawn
+      rel.as!(solr_params[:qt] ||= blacklight_config.qt)
+      unless args.first.nil? or args.first.eql? blacklight_config.solr_path
+        rel.from!(blacklight_config.table.at(args.first))
+      else
+        rel.from!(blacklight_config.table.at(blacklight_config.solr_path))
+      end
       
-      solr_response = Blacklight::SolrResponse.new(res, solr_params, solr_document_model: blacklight_config.solr_document_model)
+      rel.load
 
       Rails.logger.debug("Solr query: #{solr_params.inspect}")
-      Rails.logger.debug("Solr response: #{solr_response.inspect}") if defined?(::BLACKLIGHT_VERBOSE_LOGGING) and ::BLACKLIGHT_VERBOSE_LOGGING
-      solr_response
+      Rails.logger.debug("Solr response: #{rel.inspect}") if defined?(::BLACKLIGHT_VERBOSE_LOGGING) and ::BLACKLIGHT_VERBOSE_LOGGING
+      rel
     end
   rescue Errno::ECONNREFUSED => e
     raise Blacklight::Exceptions::ECONNREFUSED.new("Unable to connect to Solr instance using #{blacklight_solr.inspect}")
   end
     
-  
+  public 
   # A helper method used for generating solr LocalParams, put quotes
   # around the term unless it's a bare-word. Escape internal quotes
   # if needed. 
@@ -123,11 +128,11 @@ module Blacklight::SolrHelper
 
     case
     when (solr_response.grouped? && grouped_key_for_results)
-      [solr_response.group(grouped_key_for_results), []]
+      [solr_response.group_by(grouped_key_for_results), []]
     when (solr_response.grouped? && solr_response.grouped.length == 1)
       [solr_response.grouped.first, []]
     else
-      [solr_response, solr_response.documents]
+      [solr_response, solr_response.to_a]
     end
   end
 
@@ -136,26 +141,21 @@ module Blacklight::SolrHelper
   # given a user query,
   # @return [Blacklight::SolrResponse] the solr response object
   def query_solr(user_params = params || {}, extra_controller_params = {})
-    solr_params = self.solr_search_params(user_params).merge(extra_controller_params)
-
-    find(solr_params)
+    relation = relation_for_params(user_params.merge(extra_controller_params))
+    yield relation if block_given?
+    relation.load
+    relation
   end
   
   # returns a params hash for finding a single solr document (CatalogController #show action)
   # If the id arg is nil, then the value is fetched from params[:id]
   # This method is primary called by the get_solr_response_for_doc_id method.
-  def solr_doc_params(id=nil)
+  def doc_relation(id=nil)
     id ||= params[:id]
 
-    # add our document id to the document_unique_id_param query parameter
-    p = blacklight_config.default_document_solr_params.merge({
-      # this assumes the request handler will map the unique id param
-      # to the unique key field using either solr local params, the 
-      # real-time get handler, etc.
-      blacklight_config.document_unique_id_param => id
-    })
+    p = blacklight_config.default_relation.where(blacklight_config.model.primary_key => id)
 
-    p[:qt] ||= blacklight_config.document_solr_request_handler
+    p.as!('document') unless (p.as_value)
 
     p
   end
@@ -163,11 +163,11 @@ module Blacklight::SolrHelper
   # a solr query method
   # retrieve a solr document, given the doc id
   # @return [Blacklight::SolrResponse, Blacklight::SolrDocument] the solr response object and the first document
-  def get_solr_response_for_doc_id(id=nil, extra_controller_params={})
-    solr_params = solr_doc_params(id).merge(extra_controller_params)
-    solr_response = find(blacklight_config.document_solr_path, solr_params)
-    raise Blacklight::Exceptions::InvalidSolrID.new if solr_response.documents.empty?
-    [solr_response, solr_response.documents.first]
+  def get_solr_response_for_doc_id(id=nil, extra_controller_params=[])
+    relation = extra_controller_params.inject(doc_relation(id)) {|memo, method| send(method, memo, {})}
+    solr_response = find(blacklight_config.document_solr_request_handler, solr_params)
+    raise Blacklight::Exceptions::InvalidSolrID.new if solr_response.to_a.empty?
+    [solr_response, solr_response.to_a.first]
   end
   
   def get_solr_response_for_document_ids(ids=[], extra_solr_params = {})
@@ -176,73 +176,85 @@ module Blacklight::SolrHelper
   
   # given a field name and array of values, get the matching SOLR documents
   # @return [Blacklight::SolrResponse, Array<Blacklight::SolrDocument>] the solr response object and a list of solr documents
-  def get_solr_response_for_field_values(field, values, extra_solr_params = {})
-    q = if Array(values).empty?
-      "NOT *:*"
+  def get_solr_response_for_field_values(field, values, extra_solr_params = [])
+    relation = relation_for_params(extra_solr_params)
+    values = Array(values) unless values.respond_to? :each
+
+    if values.empty?
+      # "NOT *:*"
+      relation.where!.not(Arel.star => Arel.star)
     else
-      "#{field}:(#{ Array(values).map { |x| solr_param_quote(x)}.join(" OR ")})"
+      relation = relation.where(field => values.first)
+      if values[1]
+        # "#{field}:(#{ values.to_a.map { |x| solr_param_quote(x)}.join(" OR ")})"
+        values[1..-1].inject(relation) {|rel, val| rel.where.or(val)}
+      end
     end
 
-    solr_params = {
-      :defType => "lucene",   # need boolean for OR
-      :q => q,
+    relation.tap do |rel|
+      rel.defType!("lucene") # need boolean for OR
       # not sure why fl * is neccesary, why isn't default solr_search_params
       # sufficient, like it is for any other search results solr request? 
       # But tests fail without this. I think because some functionality requires
       # this to actually get solr_doc_params, not solr_search_params. Confused
       # semantics again. 
-      :fl => "*",  
-      :facet => 'false',
-      :spellcheck => 'false'
-    }.merge(extra_solr_params)
+      rel.select!(Arel.star)
+      rel.unscope(:facet)
+      rel.unscope(:spellcheck)
+    end
     
-    solr_response = find(self.solr_search_params().merge(solr_params) )
-    [solr_response, solr_response.documents]
+    solr_response = relation.load
+    [solr_response,relation.to_a]
   end
-  
+
+  def facet_opts_for(expr, relation)
+    matches = relation.facet_values.select {|f| f.expr.to_s.eql(expr.to_s)}
+    matches.inject({}) {|m,f| m.merge!(f.opts)}
+  end
+
+  def default_facet_opts(relation=nil)
+    relation ||= blacklight_config.default_relation
+    facet_opts_for(Arel.star, relation)
+  end
+
   # returns a params hash for a single facet field solr query.
   # used primary by the get_facet_pagination method.
   # Looks up Facet Paginator request params from current request
   # params to figure out sort and offset.
   # Default limit for facet list can be specified by defining a controller
   # method facet_list_limit, otherwise 20. 
-  def solr_facet_params(facet_field, user_params=params || {}, extra_controller_params={})
-    input = user_params.deep_merge(extra_controller_params)
+  def facet_on(facet_field, user_params=params || {}, extra_controller_params=[])
+    input = user_params #.deep_merge(extra_controller_params)
     facet_config = blacklight_config.facet_fields[facet_field]
 
     # First start with a standard solr search params calculations,
     # for any search context in our request params. 
-    solr_params = solr_search_params(user_params).merge(extra_controller_params)
+    relation = relation_for_params(user_params.merge(extra_controller_params))
     
-    # Now override with our specific things for fetching facet values
-    solr_params[:"facet.field"] = with_ex_local_param((facet_config.ex if facet_config.respond_to?(:ex)), facet_field)
+    if respond_to?(:facet_list_limit)
+      limit = facet_list_limit.to_s.to_i
+    elsif (default_limit = default_facet_opts[:limit]) 
+      limit = default_limit.to_i
+    else
+      limit = 20
+    end
+    facet_opts = {limit: limit}
+    facet_opts[:offset] = ( input.fetch(Blacklight::Solr::FacetPaginator.request_keys[:page] , 1).to_i - 1 ) * ( limit )
+    if  input[  Blacklight::Solr::FacetPaginator.request_keys[:sort] ]
+      facet_opts[:sort] = input[  Blacklight::Solr::FacetPaginator.request_keys[:sort] ]
+    end
 
-    limit =  
-      if respond_to?(:facet_list_limit)
-        facet_list_limit.to_s.to_i
-      elsif solr_params["facet.limit"] 
-        solr_params["facet.limit"].to_i
-      else
-        20
-      end
-
-    # Need to set as f.facet_field.facet.* to make sure we
-    # override any field-specific default in the solr request handler. 
-    solr_params[:"f.#{facet_field}.facet.limit"]  = limit + 1
-    solr_params[:"f.#{facet_field}.facet.offset"] = ( input.fetch(Blacklight::Solr::FacetPaginator.request_keys[:page] , 1).to_i - 1 ) * ( limit )
-    solr_params[:"f.#{facet_field}.facet.sort"] = input[  Blacklight::Solr::FacetPaginator.request_keys[:sort] ] if  input[  Blacklight::Solr::FacetPaginator.request_keys[:sort] ]   
-    solr_params[:rows] = 0
-
-    return solr_params
+    return relation.facet(facet_field, facet_opts).limit(0)
   end
   
   ##
   # Get the solr response when retrieving only a single facet field
   # @return [Blacklight::SolrResponse] the solr response
-  def get_facet_field_response(facet_field, user_params = params || {}, extra_controller_params = {})
-    solr_params = solr_facet_params(facet_field, user_params, extra_controller_params)
+  def get_facet_field_response(facet_field, user_params = params || {}, extra_controller_params = [])
+    relation = facet_on(facet_field, user_params, extra_controller_params)
     # Make the solr call
-    find(solr_params)
+    relation.load
+    relation
   end
 
   # a solr query method
@@ -252,7 +264,7 @@ module Blacklight::SolrHelper
     # Make the solr call
     response = get_facet_field_response(facet_field, user_params, extra_controller_params)
 
-    limit = response.params[:"f.#{facet_field}.facet.limit"].to_s.to_i - 1
+    limit = response.facets[:"f.#{facet_field}.facet.limit"].to_s.to_i - 1
 
     # Actually create the paginator!
     # NOTE: The sniffing of the proper sort from the solr response is not
@@ -273,13 +285,13 @@ module Blacklight::SolrHelper
   # the Blacklight app-level request params that define the search. 
   # @return [Blacklight::SolrDocument, nil] the found document or nil if not found
   def get_single_doc_via_search(index, request_params)
-    solr_params = solr_search_params(request_params)
+    relation = relation_for_params(request_params)
 
-    solr_params[:start] = (index - 1) # start at 0 to get 1st doc, 1 to get 2nd.    
-    solr_params[:rows] = 1
-    solr_params[:fl] = '*'
-    solr_response = find(solr_params)
-    solr_response.documents.first
+    relation.offset(index - 1) # start at 0 to get 1st doc, 1 to get 2nd.    
+    relation.limit(1)
+    relation.select('*')
+    relation.load
+    relation.to_a.first
   end
   deprecation_deprecate :get_single_doc_via_search
 
@@ -287,34 +299,34 @@ module Blacklight::SolrHelper
   # @return [Blacklight::SolrResponse, Array<Blacklight::SolrDocument>] the solr response and a list of the first and last document
   def get_previous_and_next_documents_for_search(index, request_params, extra_controller_params={})
 
-    solr_params = solr_search_params(request_params).merge(extra_controller_params)
+    relation = relation_for_params(request_params.merge(extra_controller_params))
 
     if index > 0
-      solr_params[:start] = index - 1 # get one before
-      solr_params[:rows] = 3 # and one after
+      relation.offset(index - 1) # get one before
+      relation.limit(3) # and one after
     else
-      solr_params[:start] = 0 # there is no previous doc
-      solr_params[:rows] = 2 # but there should be one after
+      relation.offset(0) # there is no previous doc
+      relation.limit(2) # but there should be one after
     end
 
-    solr_params[:fl] = '*'
-    solr_params[:facet] = false
-    solr_response = find(solr_params)
+    relation.select('*')
+    relation.unscope(:facet)
+    relation.load
 
-    document_list = solr_response.documents
+    document_list = relation.to_a
 
     # only get the previous doc if there is one
     prev_doc = document_list.first if index > 0
-    next_doc = document_list.last if (index + 1) < solr_response.total
+    next_doc = document_list.last if (index + 1) < relation.count
 
-    [solr_response, [prev_doc, next_doc]]
+    [relation, [prev_doc, next_doc]]
   end
     
   # returns a solr params hash
   # the :fl (solr param) is set to the "field" value.
   # per_page is set to 10
   def solr_opensearch_params(field=nil)
-    solr_params = solr_search_params
+    solr_params = relation_for_params
     solr_params[:per_page] = 10
     solr_params[:fl] = field || blacklight_config.view_config('opensearch').title_field
     solr_params
@@ -333,11 +345,9 @@ module Blacklight::SolrHelper
     a << response.documents.map {|doc| doc[solr_params[:fl]].to_s }
   end
   
-  DEFAULT_FACET_LIMIT = 10
-
   # Look up facet limit for given facet_field. Will look at config, and
   # if config is 'true' will look up from Solr @response if available. If
-  # no limit is avaialble, returns nil. Used from #solr_search_params
+  # no limit is avaialble, returns nil. Used from #relation_for_params
   # to supply f.fieldname.facet.limit values in solr request (no @response
   # available), and used in display (with @response available) to create
   # a facet paginator with the right limit. 
